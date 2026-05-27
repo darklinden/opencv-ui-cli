@@ -2,14 +2,14 @@
 
 ## Context
 
-用户需要自动识别 UI 设计稿中各个组件的位置。输入一张完整设计图 `design.png` 和一个 `components/` 文件夹，使用 OpenCV 模板匹配找到每个组件在 design 中的位置。需考虑组件被其他控件遮挡的情况，以信任度标记。输出 TOML 位置列表 + 每个组件一张 `{组件名}-match.png` 可视化确认图。
+用户需要自动识别 UI 设计稿中各个组件的位置。输入一张完整设计图 `design.png` 和一个 `components/` 文件夹，使用 OpenCV 模板匹配找到每个组件在 design 中的位置。需考虑组件被其他控件遮挡的情况，以信任度标记。输出 TOML 位置列表 + 每个组件一张 `{组件名}-matches-N.png` 可视化确认图。
 
 ## 技术选型
 
 - **语言**：Rust
 - **图像库**：`opencv` crate（模板匹配 + 图像合成）
 - **SVG 渲染**：`resvg` + `usvg`（SVG → 像素，用作蒙版叠加层）
-- **输出**：TOML（位置数据） + 每组件一张 `{name}-match.png`
+- **输出**：TOML（位置数据） + 每组件一张 `{name}-matches-N.png`
 
 ## 项目结构
 
@@ -27,8 +27,8 @@ opencv-ui-cli/
 输出示例：
 ```
 match_result.toml
-button-match.png      # design + button 位置蒙版
-icon-match.png        # design + icon 位置蒙版
+button-matches-N.png      # design + button 位置蒙版
+icon-matches-N.png        # design + icon 位置蒙版
 ```
 
 ## 动态阈值降级匹配
@@ -66,7 +66,7 @@ Options:
   --min-threshold <float>      最低阈值，默认 0.5
   --threshold-step <float>     每次降低步长，默认 0.05
   --nms-threshold <float>      NMS IoU 阈值，默认 0.3
-  --no-mask                    不生成 {name}-match.png
+  --no-mask                    不生成 {name}-matches-N.png
 ```
 
 ## 核心流程
@@ -80,7 +80,7 @@ Options:
    a. 根据该组件的匹配位置，用 `<rect>` 构建 SVG 蒙版（不同信任度不同颜色）
    b. `resvg` 将 SVG 渲染为 RGBA 像素缓冲区
    c. OpenCV 将蒙版图层 alpha 混合到 design 副本上
-   d. 保存为 `{组件名}-match.png`
+   d. 保存为 `{组件名}-matches-N.png`
 
 ## Alpha Mask 处理
 
@@ -177,4 +177,4 @@ usvg = "0.42"
 1. 准备测试 design（几何图形拼接），截取组件，额外做一个被遮挡的变体
 2. 运行 `cargo run -- design.png components/`
 3. 检查 `match_result.toml` 坐标与信任度是否正确
-4. 打开各 `{name}-match.png`，目视确认蒙版位置、颜色是否准确
+4. 打开各 `{name}-matches-N.png`，目视确认蒙版位置、颜色是否准确

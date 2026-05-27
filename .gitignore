@@ -1,5 +1,5 @@
 /target
 match_result.toml
-*-match.png
+*-matches-*.png
 /examples
 .claude

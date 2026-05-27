@@ -135,7 +135,7 @@ fn component_files(dir: &Path) -> Result<Vec<PathBuf>> {
         if path.is_file() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // Skip mask output files from previous runs
-            if name.ends_with("-match.png") {
+            if name.contains("-matches-") && name.ends_with(".png") {
                 continue;
             }
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -503,6 +503,15 @@ fn main() -> Result<()> {
         );
     }
 
+    // Clean up mask files from previous runs
+    for entry in std::fs::read_dir(&cli.components_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.contains("-matches-") && name.ends_with(".png") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
     // Load design
     let design = load_image(&cli.design)?;
     let design_w = design.cols();
@@ -563,7 +572,7 @@ fn main() -> Result<()> {
                     let mask_path = comp_path
                         .parent()
                         .unwrap_or(Path::new("."))
-                        .join(format!("{}-match.png", stem));
+                        .join(format!("{}-matches-{}.png", stem, count));
                     if let Err(e) =
                         generate_mask_image(&design, &positions, &comp_name, &mask_path)
                     {
