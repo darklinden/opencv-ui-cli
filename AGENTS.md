@@ -31,22 +31,29 @@ button-match.png      # design + button 位置蒙版
 icon-match.png        # design + icon 位置蒙版
 ```
 
-## 信任度模型
+## 动态阈值降级匹配
 
-两阶段匹配：
+乐观假设：components 目录下的每张图在 design 中**至少存在一次**。
 
-| 阶段 | 阈值 | 说明 |
-|------|------|------|
-| 阶段 1 | 0.85 | 清晰可见组件 → trust = `high`，标记区域为"已占用" |
-| 阶段 2 | 0.5 | 剩余区域搜索，与 high 区域重叠 → trust = `low`，不重叠 → trust = `medium` |
+匹配时从高阈值开始，逐步降低直到找到匹配：
 
-### 信任度等级与蒙版颜色
+```
+threshold = 0.95
+while threshold >= 0.5:
+    matches = matchTemplate(threshold)
+    if matches 非空 → 记录结果，结束本组件
+    threshold -= 0.05
+```
 
-| 等级 | 含义 | 蒙版颜色 |
-|------|------|----------|
-| `high` | 清晰匹配，高度可信 | 绿色半透明 rgba(0,200,0,0.3) |
-| `medium` | 存在但匹配模糊 | 黄色半透明 rgba(200,200,0,0.3) |
-| `low` | 可能被遮挡 | 红色半透明 rgba(200,0,0,0.3) |
+### 信任度等级
+
+信任度基于**单次匹配的置信度分数**，与匹配时的阈值无关：
+
+| 等级 | 条件 | 含义 | 蒙版颜色 |
+|------|------|------|----------|
+| `high` | confidence >= 0.90 | 高度可信 | 绿色半透明 |
+| `medium` | confidence >= 0.75 | 基本可信 | 黄色半透明 |
+| `low` | confidence < 0.75 | 存疑，需人工确认 | 红色半透明 |
 
 ## CLI 接口
 
@@ -54,21 +61,20 @@ icon-match.png        # design + icon 位置蒙版
 opencv-ui-cli <design> <components-dir> [options]
 
 Options:
-  -o, --output <path>         输出 TOML 路径，默认 match_result.toml
-  --high-threshold <float>    高置信度阈值，默认 0.85
-  --low-threshold <float>     低置信度阈值，默认 0.5
-  --nms-threshold <float>     NMS IoU 阈值，默认 0.3
-  --no-mask                   不生成 {name}-match.png
+  -o, --output <path>          输出 TOML 路径，默认 match_result.toml
+  --start-threshold <float>    起始阈值，默认 0.95
+  --min-threshold <float>      最低阈值，默认 0.5
+  --threshold-step <float>     每次降低步长，默认 0.05
+  --nms-threshold <float>      NMS IoU 阈值，默认 0.3
+  --no-mask                    不生成 {name}-match.png
 ```
 
 ## 核心流程
 
 1. 设计图用 `IMREAD_COLOR` 加载（不需要 alpha）
 2. 遍历 components/ 下所有图片，用 `load_with_mask` 加载（见下方 Alpha Mask 处理）
-3. **阶段 1** — matchTemplate(threshold=0.85, mask=alpha) → NMS → trust=high，记录已占用矩形列表
-4. **阶段 2** — matchTemplate(threshold=0.5, mask=alpha) → 排除已被占用的候选 → NMS →
-   - 与 high 区域重叠 → trust=low
-   - 无重叠 → trust=medium
+3. **动态降阈** — 从 start_threshold 开始 matchTemplate(mask=alpha)，匹配到则记录后跳出，否则降 step 重试，直到 min_threshold
+4. NMS 去重，按置信度分 trust 等级
 5. 汇总 → 输出 match_result.toml
 6. **生成可视化**（每组件一张）：
    a. 根据该组件的匹配位置，用 `<rect>` 构建 SVG 蒙版（不同信任度不同颜色）

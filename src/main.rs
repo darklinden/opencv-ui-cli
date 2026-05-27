@@ -25,13 +25,17 @@ struct Cli {
     #[arg(short = 'o', long, default_value = "match_result.toml")]
     output: PathBuf,
 
-    /// High-confidence threshold (stage 1)
-    #[arg(long, default_value = "0.85")]
-    high_threshold: f64,
+    /// Starting threshold (optimistic). Lowered stepwise until a match is found.
+    #[arg(long, default_value = "0.95")]
+    start_threshold: f64,
 
-    /// Low-confidence threshold for occlusion detection (stage 2)
+    /// Minimum threshold to try before giving up.
     #[arg(long, default_value = "0.5")]
-    low_threshold: f64,
+    min_threshold: f64,
+
+    /// Amount to lower the threshold on each retry.
+    #[arg(long, default_value = "0.05")]
+    threshold_step: f64,
 
     /// NMS IoU threshold
     #[arg(long, default_value = "0.3")]
@@ -303,69 +307,56 @@ fn iou(a: &Rect, b: &Rect) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Two-stage matching with trust levels
+// Dynamic threshold descent matching
 // ---------------------------------------------------------------------------
 
+fn trust_label(confidence: f64) -> &'static str {
+    if confidence >= 0.90 {
+        "high"
+    } else if confidence >= 0.75 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+/// Try thresholds from start down to min, stepping by `step`.
+/// Returns as soon as at least one match is found at the current threshold.
+/// Trust is assigned per-match based on individual confidence.
 fn match_component(
     design: &Mat,
     templ: &Mat,
     mask: &Option<Mat>,
     component_name: &str,
-    high_threshold: f64,
-    low_threshold: f64,
+    start_threshold: f64,
+    min_threshold: f64,
+    step: f64,
     nms_threshold: f64,
-) -> Result<Vec<Position>> {
+) -> Result<(f64, Vec<Position>)> {
     let tw = templ.cols();
     let th = templ.rows();
-    let mut all_positions: Vec<Position> = Vec::new();
-    let mut occupied: Vec<Rect> = Vec::new();
+    let mut threshold = start_threshold;
 
-    // Stage 1: high-confidence matches
-    let stage1 = match_template_nms(design, templ, mask, high_threshold, nms_threshold)?;
-    for (conf, rect) in &stage1 {
-        all_positions.push(Position {
-            x: rect.x,
-            y: rect.y,
-            width: tw,
-            height: th,
-            confidence: (*conf * 10000.0).round() / 10000.0,
-            trust: "high".into(),
-        });
-        occupied.push(*rect);
-    }
-
-    // Stage 2: low-confidence matches in remaining areas
-    let stage2 = match_template_nms(design, templ, mask, low_threshold, nms_threshold)?;
-    for (conf, rect) in &stage2 {
-        // Skip if this detection overlaps significantly with a stage-1 match
-        let overlaps_high = occupied.iter().any(|occ| iou(rect, occ) > nms_threshold);
-        if overlaps_high {
-            continue; // already captured by a high-confidence match at this location
+    while threshold >= min_threshold - 1e-9 {
+        let matches = match_template_nms(design, templ, mask, threshold, nms_threshold)?;
+        if !matches.is_empty() {
+            let positions: Vec<Position> = matches
+                .into_iter()
+                .map(|(conf, rect)| Position {
+                    x: rect.x,
+                    y: rect.y,
+                    width: tw,
+                    height: th,
+                    confidence: (conf * 10000.0).round() / 10000.0,
+                    trust: trust_label(conf).into(),
+                })
+                .collect();
+            return Ok((threshold, positions));
         }
-
-        // Check if this low-confidence match overlaps any occupied area
-        let partially_occluded = occupied.iter().any(|occ| iou(rect, occ) > 0.0);
-
-        all_positions.push(Position {
-            x: rect.x,
-            y: rect.y,
-            width: tw,
-            height: th,
-            confidence: (*conf * 10000.0).round() / 10000.0,
-            trust: if partially_occluded {
-                "low".into()
-            } else {
-                "medium".into()
-            },
-        });
-        occupied.push(*rect);
+        threshold = (threshold - step * 100.0).round() / 100.0;
     }
 
-    if all_positions.is_empty() {
-        anyhow::bail!("no matches found for {}", component_name);
-    }
-
-    Ok(all_positions)
+    anyhow::bail!("no matches found for {} (tried down to {})", component_name, min_threshold)
 }
 
 // ---------------------------------------------------------------------------
@@ -551,16 +542,18 @@ fn main() -> Result<()> {
             &templ,
             &mask,
             &comp_name,
-            cli.high_threshold,
-            cli.low_threshold,
+            cli.start_threshold,
+            cli.min_threshold,
+            cli.threshold_step,
             cli.nms_threshold,
         ) {
-            Ok(positions) => {
+            Ok((matched_at, positions)) => {
                 let count = positions.len();
                 let trusts: Vec<&str> = positions.iter().map(|p| p.trust.as_str()).collect();
                 eprintln!(
-                    "    {} match(es) [{}]",
+                    "    {} match(es) @threshold={} [{}]",
                     count,
+                    matched_at,
                     trusts.join(", ")
                 );
 
