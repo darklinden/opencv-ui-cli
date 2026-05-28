@@ -1011,6 +1011,13 @@ fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| cli.components_dir.join(".yolo-cache").join("ui-detect.pt"));
 
+        eprintln!("--- YOLO fallback ---");
+        eprintln!(
+            "    config: trigger_threshold={} detect_conf={} epochs={} cache={}",
+            cli.yolo_threshold, cli.yolo_conf, cli.yolo_epochs,
+            cache_path.display()
+        );
+
         let yolo_config = yolo::YoloConfig {
             enabled: true,
             threshold: cli.yolo_threshold,
@@ -1018,8 +1025,6 @@ fn main() -> Result<()> {
             epochs: cli.yolo_epochs,
             cache: cache_path,
         };
-
-        eprintln!("--- YOLO fallback ---");
         match yolo::run_yolo(&yolo_config, &cli.design, &cli.components_dir) {
             Ok(Some(detections)) => {
                 // Use YOLO regions as search proposals for precise template matching
@@ -1074,6 +1079,12 @@ fn main() -> Result<()> {
                                 let yd = yolo_dets[idx];
 
                                 // YOLO-guided localized template matching
+                                eprintln!(
+                                    "    YOLO refine: {} bbox=({},{},{}x{}) margin=0.5 start={} min={} step={} nms={}",
+                                    entry.component,
+                                    yd.bbox[0], yd.bbox[1], yd.bbox[2], yd.bbox[3],
+                                    cli.start_threshold, 0.4, cli.threshold_step, cli.nms_threshold
+                                );
                                 if let Some(refined) = yolo::refine_yolo_region(
                                     &design,
                                     &templ,
@@ -1081,6 +1092,7 @@ fn main() -> Result<()> {
                                     &yd.bbox,
                                     0.5, // expand YOLO bbox by 50%
                                     cli.start_threshold,
+                                    0.4, // min_threshold: stop before noise
                                     cli.threshold_step,
                                     cli.nms_threshold,
                                 ) {
@@ -1090,25 +1102,13 @@ fn main() -> Result<()> {
                                     );
                                     new_positions.push(refined);
                                 } else {
-                                    // Template matching failed in YOLO region — keep YOLO
-                                    // bbox as fallback (tagged as yolo source)
+                                    // Template matching failed in YOLO region → YOLO
+                                    // detection was a false positive, keep original position
                                     eprintln!(
-                                        "    YOLO fallback: {} keeping yolo bbox (no template match in region)",
+                                        "    YOLO reject: {} (no template match in yolo region, keeping original)",
                                         entry.component
                                     );
-                                    new_positions.push(Position {
-                                        x: yd.bbox[0],
-                                        y: yd.bbox[1],
-                                        width: yd.bbox[2],
-                                        height: yd.bbox[3],
-                                        confidence: (yd.confidence * 10000.0).round() / 10000.0,
-                                        trust: if yd.confidence >= 0.75 {
-                                            "medium".into()
-                                        } else {
-                                            "low".into()
-                                        },
-                                        source: "yolo".into(),
-                                    });
+                                    new_positions.push(pos.clone());
                                 }
                             } else {
                                 new_positions.push(pos.clone());
@@ -1118,10 +1118,17 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    // Append remaining unused YOLO detections as new positions
+                    // Append remaining unused YOLO detections — only if template
+                    // matching confirms the component is actually in that region
                     for (i, yd) in yolo_dets.iter().enumerate() {
                         if !yolo_used[i] {
-                            // Try localized template matching first
+                            eprintln!(
+                                "    YOLO new-detect: {} bbox=({},{},{}x{}) yolo_conf={:.4} margin=0.5 start={} min={} step={} nms={}",
+                                entry.component,
+                                yd.bbox[0], yd.bbox[1], yd.bbox[2], yd.bbox[3],
+                                yd.confidence,
+                                cli.start_threshold, 0.4, cli.threshold_step, cli.nms_threshold
+                            );
                             if let Some(refined) = yolo::refine_yolo_region(
                                 &design,
                                 &templ,
@@ -1129,6 +1136,7 @@ fn main() -> Result<()> {
                                 &yd.bbox,
                                 0.5,
                                 cli.start_threshold,
+                                0.4,
                                 cli.threshold_step,
                                 cli.nms_threshold,
                             ) {
@@ -1139,27 +1147,9 @@ fn main() -> Result<()> {
                                 new_positions.push(refined);
                             } else {
                                 eprintln!(
-                                    "    YOLO append: {} new position ({},{} {}x{} conf={:.4})",
-                                    entry.component,
-                                    yd.bbox[0],
-                                    yd.bbox[1],
-                                    yd.bbox[2],
-                                    yd.bbox[3],
-                                    yd.confidence
+                                    "    YOLO skip: {} (no template match in yolo region, discarding)",
+                                    entry.component
                                 );
-                                new_positions.push(Position {
-                                    x: yd.bbox[0],
-                                    y: yd.bbox[1],
-                                    width: yd.bbox[2],
-                                    height: yd.bbox[3],
-                                    confidence: (yd.confidence * 10000.0).round() / 10000.0,
-                                    trust: if yd.confidence >= 0.75 {
-                                        "medium".into()
-                                    } else {
-                                        "low".into()
-                                    },
-                                    source: "yolo".into(),
-                                });
                             }
                         }
                     }

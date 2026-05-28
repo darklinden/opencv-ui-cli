@@ -7,6 +7,7 @@ Subcommands:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -51,9 +52,15 @@ def parse_args():
 # Train
 # ---------------------------------------------------------------------------
 
-def collect_components(comp_dir: Path) -> dict[str, Image.Image]:
-    """Return {class_name: PIL.Image} for every image in comp_dir."""
+def _make_guid(name: str) -> str:
+    """Derive a meaningless GUID from a filename so YOLO is not misled by semantics."""
+    return "c" + hashlib.md5(name.encode()).hexdigest()[:7]
+
+
+def collect_components(comp_dir: Path) -> tuple[dict[str, Image.Image], dict[str, str]]:
+    """Return ({guid: PIL.Image}, {guid: original_stem}) for every image in comp_dir."""
     components = {}
+    guid_map = {}  # guid → original stem (for reverse lookup)
     for f in sorted(comp_dir.iterdir()):
         if not f.is_file():
             continue
@@ -61,10 +68,12 @@ def collect_components(comp_dir: Path) -> dict[str, Image.Image]:
             continue
         if "-matches-" in f.stem:
             continue
-        name = f.stem  # file name without extension → YOLO class name
+        stem = f.stem
+        guid = _make_guid(stem)
+        guid_map[guid] = stem
         img = Image.open(f).convert("RGBA")
-        components[name] = img
-    return components
+        components[guid] = img
+    return components, guid_map
 
 
 def random_background(w: int, h: int) -> Image.Image:
@@ -183,13 +192,14 @@ def train_yolo(
     """Full training pipeline: generate data → train → save model."""
     from ultralytics import YOLO
 
-    components = collect_components(components_dir)
+    components, guid_map = collect_components(components_dir)
     if not components:
         print(json.dumps({"error": "no component images found"}))
         sys.exit(1)
 
-    class_names = sorted(components.keys())
-    print(f"Found {len(components)} component(s): {class_names}", file=sys.stderr)
+    class_names = sorted(components.keys())  # GUIDs
+    stem_names = [guid_map[g] for g in class_names]
+    print(f"Found {len(components)} component(s): {stem_names}", file=sys.stderr)
 
     # Generate training data
     work_dir = Path(tempfile.mkdtemp(prefix="yolo_train_"))
@@ -197,7 +207,7 @@ def train_yolo(
         datasets_dir = work_dir / "datasets" / "train"
         generate_training_data(components, datasets_dir, num_samples=50, imgsz=imgsz)
 
-        # Write data.yaml
+        # Write data.yaml (uses GUID class names)
         data_yaml = work_dir / "data.yaml"
         data_yaml.write_text(
             f"path: {work_dir / 'datasets'}\n"
@@ -210,7 +220,7 @@ def train_yolo(
         print(f"Generated {len(list((datasets_dir / 'images').iterdir()))} training images", file=sys.stderr)
 
         # Train
-        model = YOLO("yolov8n.pt")
+        model = YOLO("./yolov8n.pt")
         model.train(
             data=str(data_yaml),
             epochs=epochs,
@@ -219,6 +229,10 @@ def train_yolo(
             verbose=False,
             exist_ok=True,
         )
+
+        # Save class map alongside model (GUID → original stem)
+        class_map_path = output_path.parent / (output_path.stem + "_map.json")
+        class_map_path.write_text(json.dumps(guid_map, indent=2))
 
         # Export/save trained model
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,6 +243,7 @@ def train_yolo(
             model.save(str(output_path))
 
         print(f"Model saved to {output_path}", file=sys.stderr)
+        print(f"Class map saved to {class_map_path}", file=sys.stderr)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -245,6 +260,12 @@ def run_detect(model_path: Path, source_path: Path, output_path: Path, conf: flo
         print(json.dumps({"error": f"model not found: {model_path}", "count": 0}))
         sys.exit(1)
 
+    # Load GUID → original stem mapping
+    class_map_path = model_path.parent / (model_path.stem + "_map.json")
+    guid_to_stem: dict[str, str] = {}
+    if class_map_path.exists():
+        guid_to_stem = json.loads(class_map_path.read_text())
+
     model = YOLO(str(model_path))
     results = model(source_path, conf=conf, device="cpu", verbose=False)
 
@@ -254,7 +275,9 @@ def run_detect(model_path: Path, source_path: Path, output_path: Path, conf: flo
             continue
         for box in r.boxes:
             cls_id = int(box.cls[0].item())
-            cls_name = model.names.get(cls_id, str(cls_id))
+            guid = model.names.get(cls_id, str(cls_id))
+            # Reverse-map GUID to original component name
+            cls_name = guid_to_stem.get(guid, guid)
             conf_val = float(box.conf[0].item())
             xyxy = box.xyxy[0].tolist()
             bbox = [

@@ -15,6 +15,7 @@ const YOLO_SCRIPT: &str = include_str!("../scripts/yolo_detect.py");
 #[derive(Deserialize, Debug)]
 pub(crate) struct YoloDetection {
     pub(crate) class_name: String,
+    #[allow(dead_code)]
     pub(crate) confidence: f64,
     pub(crate) bbox: [i32; 4], // [x, y, width, height]
 }
@@ -71,12 +72,22 @@ pub fn run_yolo(
 
     let script_path = ext_dir.join("yolo_detect.py");
 
+    eprintln!(
+        "    YOLO: ext_dir={} python={}",
+        ext_dir.display(),
+        python.display()
+    );
+
     // Train if cache is stale
     let need_train = !config.cache.exists()
         || is_cache_stale(components_dir, &config.cache);
 
     if need_train {
-        eprintln!("    YOLO: training model (this may take a few minutes)...");
+        eprintln!(
+            "    YOLO: training model -> {} (epochs={})",
+            config.cache.display(),
+            config.epochs
+        );
         let status = Command::new(&python)
             .arg(&script_path)
             .arg("train")
@@ -97,6 +108,11 @@ pub fn run_yolo(
 
     let output_json = ext_dir.join("yolo_result.json");
 
+    eprintln!(
+        "    YOLO: running detection (conf={}) on {}",
+        config.conf,
+        design_path.display()
+    );
     let status = Command::new(&python)
         .arg(&script_path)
         .arg("detect")
@@ -147,10 +163,24 @@ pub fn refine_yolo_region(
     yolo_bbox: &[i32; 4],
     margin: f64,
     start_threshold: f64,
+    min_threshold: f64,
     step: f64,
     nms_threshold: f64,
 ) -> Option<Position> {
     let (dw, dh) = (design.cols(), design.rows());
+
+    // Skip if YOLO bbox size is wildly different from template — likely a
+    // semantic false positive (e.g. a large decorative flower vs. a flower tile)
+    let templ_area = (templ.cols() * templ.rows()) as f64;
+    let yolo_area = (yolo_bbox[2] * yolo_bbox[3]) as f64;
+    let size_ratio = if templ_area > yolo_area {
+        templ_area / yolo_area
+    } else {
+        yolo_area / templ_area
+    };
+    if size_ratio > 9.0 {
+        return None;
+    }
 
     // Expand the YOLO bbox by margin on all sides
     let expand_w = (yolo_bbox[2] as f64 * margin) as i32;
@@ -170,16 +200,30 @@ pub fn refine_yolo_region(
         Ok(m) => m,
         Err(_) => return None,
     };
-    // Copy ROI to a standalone Mat (BoxedRef doesn't deref to Mat)
     let crop_mat = crop.clone_pointee();
+    let crop_area = crop_w * crop_h;
 
-    // Run template matching on the crop with dynamic threshold descent
+    eprintln!(
+        "       yolo-refine: crop=({},{},{}x{}) area={} templ=({}x{}) margin={:.2}",
+        crop_x, crop_y, crop_w, crop_h, crop_area,
+        templ.cols(), templ.rows(),
+        margin
+    );
+
+    // Run template matching on the crop with dynamic threshold descent.
+    // Stop at min_threshold — below that matches are noise.
     let mut threshold = start_threshold;
-    while threshold >= -1e-9 {
+    while threshold >= min_threshold - 1e-9 {
         if let Ok(matches) =
             crate::match_template_nms(&crop_mat, templ, mask, threshold, nms_threshold)
         {
             if let Some((conf, rect)) = matches.into_iter().max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()) {
+                eprintln!(
+                    "       yolo-refine: match at threshold={:.2} conf={:.4} pos=({},{}) trust={}",
+                    threshold, conf,
+                    crop_x + rect.x, crop_y + rect.y,
+                    crate::trust_label(conf)
+                );
                 return Some(Position {
                     x: crop_x + rect.x,
                     y: crop_y + rect.y,
@@ -193,6 +237,8 @@ pub fn refine_yolo_region(
         }
         threshold = ((threshold - step) * 100.0).round() / 100.0;
     }
+
+    eprintln!("       yolo-refine: no match down to {:.2}", min_threshold);
 
     None
 }
