@@ -81,6 +81,27 @@ Options:
    b. `resvg` 将 SVG 渲染为 RGBA 像素缓冲区
    c. OpenCV 将蒙版图层 alpha 混合到 design 副本上
    d. 保存为 `{组件名}-matches-N.png`
+7. **生成重构设计图** — `try-implement-design.png`：
+   a. 创建与 design 等大的白色画布
+   b. 将每个组件的 opaque 像素（通过 alpha mask）绘制到匹配位置上
+   c. 用 SVG 绘制各组件对应的半透明虚线框 + 文件名/置信度标签（不同组件不同颜色）
+   d. `resvg` 渲染 SVG 图层，alpha 混合到画布上
+   e. 保存为 `try-implement-design.png`
+
+## try-implement-design.png
+
+白底重构图为每个组件预留了不同颜色的标识：
+
+| 组件序号 | 框体颜色 | hex |
+|----------|---------|-----|
+| 1 | 红 | #e74c3c |
+| 2 | 绿 | #2ecc71 |
+| 3 | 蓝 | #3498db |
+| 4 | 橙 | #f39c12 |
+| 5 | 紫 | #9b59b6 |
+| 6 | 青 | #1abc9c |
+| 7 | 深橙 | #e67e22 |
+| 8 | 深蓝 | #2980b9 |
 
 ## Alpha Mask 处理
 

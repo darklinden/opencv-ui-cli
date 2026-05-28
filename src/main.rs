@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use opencv::{
-    core::{self, Mat, Point, Rect, VecN},
+    core::{self, Mat, Point, Rect, Scalar, VecN},
     imgcodecs, imgproc,
     prelude::*,
 };
@@ -29,10 +29,6 @@ struct Cli {
     #[arg(long, default_value = "0.95")]
     start_threshold: f64,
 
-    /// Minimum threshold to try before giving up.
-    #[arg(long, default_value = "0.5")]
-    min_threshold: f64,
-
     /// Amount to lower the threshold on each retry.
     #[arg(long, default_value = "0.05")]
     threshold_step: f64,
@@ -44,6 +40,12 @@ struct Cli {
     /// Skip generating {component}-match.png mask images
     #[arg(long)]
     no_mask: bool,
+
+    /// Alpha threshold for mask: pixels with alpha below this value are excluded
+    /// from template matching. Use 200+ for semi-transparent components (shadows,
+    /// glows) to match only the opaque core. Default 0 = include all non-zero alpha.
+    #[arg(long, default_value = "0")]
+    alpha_threshold: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,9 +97,10 @@ fn load_image(path: &Path) -> Result<Mat> {
     Ok(img)
 }
 
-/// Load an image with alpha channel preserved.
-/// Returns (bgr_pixels, alpha_mask) where alpha_mask is None for images without alpha.
-fn load_with_mask(path: &Path) -> Result<(Mat, Option<Mat>)> {
+/// Load an image, optionally filtering the alpha mask by threshold.
+/// Pixels with alpha < `alpha_threshold` are zeroed in the mask (excluded from matching).
+/// Returns (bgr_pixels, alpha_mask). Alpha mask is None for images without alpha.
+fn load_with_mask(path: &Path, alpha_threshold: u8) -> Result<(Mat, Option<Mat>)> {
     let raw = imgcodecs::imread(
         path.to_str().context("invalid path")?,
         imgcodecs::IMREAD_UNCHANGED,
@@ -121,7 +124,21 @@ fn load_with_mask(path: &Path) -> Result<(Mat, Option<Mat>)> {
         let mut alpha = Mat::default();
         core::extract_channel(&raw, &mut alpha, 3)?;
 
-        Ok((bgr, Some(alpha)))
+        // Threshold alpha mask: pixels with alpha < threshold are zeroed.
+        // THRESH_TOZERO keeps src > thresh, so we subtract 1 to make it >=.
+        if alpha_threshold > 0 {
+            let mut thresholded = Mat::default();
+            imgproc::threshold(
+                &alpha,
+                &mut thresholded,
+                alpha_threshold.saturating_sub(1) as f64,
+                255.0,
+                imgproc::THRESH_TOZERO,
+            )?;
+            Ok((bgr, Some(thresholded)))
+        } else {
+            Ok((bgr, Some(alpha)))
+        }
     } else {
         Ok((raw, None))
     }
@@ -254,7 +271,7 @@ fn match_template_nms(
             } else {
                 raw
             };
-            if score >= threshold {
+            if score >= threshold && score.is_finite() {
                 candidates.push((score, Point::new(c, r)));
             }
         }
@@ -320,7 +337,7 @@ fn trust_label(confidence: f64) -> &'static str {
     }
 }
 
-/// Try thresholds from start down to min, stepping by `step`.
+/// Try thresholds from start down to 0, stepping by `step`.
 /// Returns as soon as at least one match is found at the current threshold.
 /// Trust is assigned per-match based on individual confidence.
 fn match_component(
@@ -329,7 +346,6 @@ fn match_component(
     mask: &Option<Mat>,
     component_name: &str,
     start_threshold: f64,
-    min_threshold: f64,
     step: f64,
     nms_threshold: f64,
 ) -> Result<(f64, Vec<Position>)> {
@@ -337,7 +353,7 @@ fn match_component(
     let th = templ.rows();
     let mut threshold = start_threshold;
 
-    while threshold >= min_threshold - 1e-9 {
+    while threshold >= -1e-9 {
         let matches = match_template_nms(design, templ, mask, threshold, nms_threshold)?;
         if !matches.is_empty() {
             let positions: Vec<Position> = matches
@@ -353,10 +369,10 @@ fn match_component(
                 .collect();
             return Ok((threshold, positions));
         }
-        threshold = (threshold - step * 100.0).round() / 100.0;
+        threshold = ((threshold - step) * 100.0).round() / 100.0;
     }
 
-    anyhow::bail!("no matches found for {} (tried down to {})", component_name, min_threshold)
+    anyhow::bail!("no matches found for {}", component_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,8 +502,268 @@ fn generate_mask_image(
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Reconstructed design (white bg + placed components + SVG overlay)
 // ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn mask_region(img: &mut Mat, rect: Rect, mask: &Option<Mat>) -> Result<()> {
+    let (x, y, w, h) = (rect.x, rect.y, rect.width, rect.height);
+    let (iw, ih) = (img.cols(), img.rows());
+
+    // Sample 2px border around the region
+    let mut sum = [0.0f64; 3];
+    let mut count = 0u64;
+
+    // Top border
+    for r in (y - 2).max(0)..(y).min(ih) {
+        for c in x.max(0)..(x + w).min(iw) {
+            if let Ok(px) = img.at_2d::<VecN<u8, 3>>(r, c) {
+                sum[0] += px[0] as f64;
+                sum[1] += px[1] as f64;
+                sum[2] += px[2] as f64;
+                count += 1;
+            }
+        }
+    }
+    // Bottom border
+    for r in (y + h).max(0)..(y + h + 2).min(ih) {
+        for c in x.max(0)..(x + w).min(iw) {
+            if let Ok(px) = img.at_2d::<VecN<u8, 3>>(r, c) {
+                sum[0] += px[0] as f64;
+                sum[1] += px[1] as f64;
+                sum[2] += px[2] as f64;
+                count += 1;
+            }
+        }
+    }
+    // Left border (excluding top/bottom already counted)
+    for r in y.max(0)..(y + h).min(ih) {
+        for c in (x - 2).max(0)..(x).min(iw) {
+            if let Ok(px) = img.at_2d::<VecN<u8, 3>>(r, c) {
+                sum[0] += px[0] as f64;
+                sum[1] += px[1] as f64;
+                sum[2] += px[2] as f64;
+                count += 1;
+            }
+        }
+    }
+    // Right border
+    for r in y.max(0)..(y + h).min(ih) {
+        for c in (x + w).max(0)..(x + w + 2).min(iw) {
+            if let Ok(px) = img.at_2d::<VecN<u8, 3>>(r, c) {
+                sum[0] += px[0] as f64;
+                sum[1] += px[1] as f64;
+                sum[2] += px[2] as f64;
+                count += 1;
+            }
+        }
+    }
+
+    let fill_bgr = if count > 0 {
+        VecN::from([
+            (sum[0] / count as f64) as u8,
+            (sum[1] / count as f64) as u8,
+            (sum[2] / count as f64) as u8,
+        ])
+    } else {
+        VecN::from([128u8, 128u8, 128u8]) // fallback gray
+    };
+
+    // Fill only opaque pixels of the component (guided by alpha mask).
+    // Transparent areas are skipped so overlapping/embedded components survive.
+    for r in y.max(0)..(y + h).min(ih) {
+        for c in x.max(0)..(x + w).min(iw) {
+            // Check mask: only fill if the component is opaque at this pixel
+            if let Some(m) = mask {
+                let mr = r - y;
+                let mc = c - x;
+                if mr >= 0 && mr < m.rows() && mc >= 0 && mc < m.cols() {
+                    if let Ok(a) = m.at_2d::<u8>(mr, mc) {
+                        if *a == 0 {
+                            continue; // transparent in component → skip
+                        }
+                    }
+                }
+            }
+            if let Ok(px) = img.at_2d_mut::<VecN<u8, 3>>(r, c) {
+                *px = fill_bgr;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn generate_reconstructed_design(
+    design_size: (i32, i32),
+    all_matches: &[MatchEntry],
+    components_dir: &Path,
+    output_path: &Path,
+) -> Result<()> {
+    let (dw, dh) = design_size;
+
+    // Create a white canvas the size of the design
+    let mut canvas = unsafe { Mat::new_rows_cols(dh, dw, core::CV_8UC3)? };
+    canvas.set_to(&Scalar::new(255.0, 255.0, 255.0, 0.0), &Mat::default())?;
+
+    // Place each component at its matched position(s)
+    for entry in all_matches {
+        let comp_path = components_dir.join(&entry.component);
+        let (bgr, alpha_opt) = load_with_mask(&comp_path, 0).unwrap_or_else(|_| {
+            // Fallback: load without alpha
+            (load_image(&comp_path).unwrap_or(Mat::default()), None)
+        });
+
+        if bgr.empty() {
+            continue;
+        }
+
+        let (th, tw) = (bgr.rows(), bgr.cols());
+
+        for pos in &entry.positions {
+            // Determine the region on the canvas where this component will be placed
+            let x = pos.x.max(0);
+            let y = pos.y.max(0);
+            let w = tw.min(dw - x);
+            let h = th.min(dh - y);
+            if w <= 0 || h <= 0 {
+                continue;
+            }
+
+            let roi = Rect::new(x, y, w, h);
+
+            if let Some(ref alpha) = alpha_opt {
+                // Alpha-blend: only paste opaque pixels
+                for r in 0..h {
+                    for c in 0..w {
+                        let a = *alpha.at_2d::<u8>(r, c).unwrap_or(&0u8);
+                        if a > 0 {
+                            let src_px = bgr.at_2d::<VecN<u8, 3>>(r, c)?;
+                            let dst_px = canvas.at_2d_mut::<VecN<u8, 3>>(y + r, x + c)?;
+                            let alpha_f = a as f64 / 255.0;
+                            for ch in 0..3 {
+                                dst_px[ch] =
+                                    (src_px[ch] as f64 * alpha_f + dst_px[ch] as f64 * (1.0 - alpha_f)) as u8;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No alpha — copy the whole rectangle
+                let src_roi = Mat::roi(&bgr, Rect::new(0, 0, w, h))?;
+                let mut dst_roi = Mat::roi_mut(&mut canvas, roi)?;
+                src_roi.copy_to(&mut dst_roi)?;
+            }
+        }
+    }
+
+    // Draw overlay boxes and labels for each component match
+    // BGR color palette (distinct per component type)
+    let palette: [(f64, f64, f64); 8] = [
+        (203.0, 67.0, 53.0),    // BGR: dark red
+        (46.0, 204.0, 113.0),   // BGR: green
+        (219.0, 152.0, 52.0),   // BGR: blue
+        (18.0, 156.0, 243.0),   // BGR: orange
+        (160.0, 68.0, 155.0),   // BGR: purple
+        (156.0, 188.0, 26.0),   // BGR: teal
+        (34.0, 126.0, 230.0),   // BGR: dark orange
+        (165.0, 111.0, 41.0),   // BGR: dark blue
+    ];
+
+    // Build SVG for semi-transparent fill boxes only (text is drawn via OpenCV)
+    let mut svg = format!(
+        r#"<svg width="{w}" height="{h}" xmlns="http://www.w3.org/2000/svg">"#,
+        w = dw,
+        h = dh
+    );
+
+    for (idx, entry) in all_matches.iter().enumerate() {
+        let (b, g, r) = palette[idx % palette.len()];
+        let fill_hex = format!("#{:02x}{:02x}{:02x}", r as u8, g as u8, b as u8);
+
+        for pos in &entry.positions {
+            svg.push_str(&format!(
+                r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" fill-opacity="0.15"/>"#,
+                x = pos.x,
+                y = pos.y,
+                w = pos.width,
+                h = pos.height,
+                fill = fill_hex
+            ));
+        }
+    }
+
+    svg.push_str("</svg>");
+
+    // Render SVG fill overlay via resvg
+    let usvg_tree =
+        usvg::Tree::from_str(&svg, &usvg::Options::default()).context("failed to parse SVG")?;
+
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(dw as u32, dh as u32).context("failed to create pixmap")?;
+
+    resvg::render(
+        &usvg_tree,
+        resvg::tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+
+    // Alpha-blend SVG overlay onto canvas
+    let overlay = pixmap.data();
+    for r in 0..dh {
+        for c in 0..dw {
+            let idx = ((r as u32 * dw as u32 + c as u32) * 4) as usize;
+            let oa = overlay[idx + 3] as f64 / 255.0;
+            if oa > 0.0 {
+                let or = overlay[idx] as f64;
+                let og = overlay[idx + 1] as f64;
+                let ob = overlay[idx + 2] as f64;
+                let px = canvas.at_2d_mut::<VecN<u8, 3>>(r, c)?;
+                px[0] = (ob * oa + px[0] as f64 * (1.0 - oa)) as u8;
+                px[1] = (og * oa + px[1] as f64 * (1.0 - oa)) as u8;
+                px[2] = (or * oa + px[2] as f64 * (1.0 - oa)) as u8;
+            }
+        }
+    }
+
+    // Draw border rectangles and text labels using OpenCV (guaranteed to render)
+    for (idx, entry) in all_matches.iter().enumerate() {
+        let (b, g, r) = palette[idx % palette.len()];
+        let color = Scalar::new(b, g, r, 0.0);
+        let short_name = entry.component.trim_end_matches(".png");
+
+        for pos in &entry.positions {
+            let rect = Rect::new(pos.x, pos.y, pos.width, pos.height);
+            imgproc::rectangle(&mut canvas, rect, color, 2, imgproc::LINE_8, 0)?;
+
+            let label = format!("{} ({:.2})", short_name, pos.confidence);
+            let label_org = Point::new(
+                pos.x,
+                if pos.y >= 20 { pos.y - 6 } else { pos.y + pos.height + 16 },
+            );
+            imgproc::put_text(
+                &mut canvas,
+                &label,
+                label_org,
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+                imgproc::LINE_8,
+                false,
+            )?;
+        }
+    }
+
+    let params = opencv::core::Vector::<i32>::new();
+    imgcodecs::imwrite(
+        output_path.to_str().context("invalid output path")?,
+        &canvas,
+        &params,
+    )?;
+
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -523,7 +799,8 @@ fn main() -> Result<()> {
         design_h
     );
 
-    // Load component images
+    // Load component images and sort by area descending (largest first).
+    // Large components are easier to find and mask out, exposing embedded ones.
     let component_paths = component_files(&cli.components_dir)?;
     if component_paths.is_empty() {
         anyhow::bail!(
@@ -531,28 +808,37 @@ fn main() -> Result<()> {
             cli.components_dir.display()
         );
     }
-    eprintln!("Found {} component(s)", component_paths.len());
+
+    struct ComponentInfo {
+        path: PathBuf,
+        name: String,
+    }
+
+    let mut comp_infos: Vec<ComponentInfo> = Vec::new();
+    for comp_path in &component_paths {
+        comp_infos.push(ComponentInfo {
+            path: comp_path.clone(),
+            name: comp_path.file_name().unwrap().to_str().unwrap().to_string(),
+        });
+    }
+    comp_infos.sort_by(|a, b| a.path.cmp(&b.path));
+
+    eprintln!("Found {} component(s)", comp_infos.len());
 
     let mut all_matches: Vec<MatchEntry> = Vec::new();
 
-    for comp_path in &component_paths {
-        let comp_name = comp_path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        eprintln!("  Matching {} ...", comp_name);
-
-        let (templ, mask) = load_with_mask(comp_path)?;
+    for info in &comp_infos {
+        let comp_name = &info.name;
+        let (templ, mask) = load_with_mask(&info.path, cli.alpha_threshold)?;
+        let (_tw, _th) = (templ.cols(), templ.rows());
+        eprintln!("  Matching {} ({}x{}) ...", comp_name, _tw, _th);
 
         match match_component(
             &design,
             &templ,
             &mask,
-            &comp_name,
+            comp_name,
             cli.start_threshold,
-            cli.min_threshold,
             cli.threshold_step,
             cli.nms_threshold,
         ) {
@@ -566,15 +852,16 @@ fn main() -> Result<()> {
                     trusts.join(", ")
                 );
 
-                // Generate per-component mask image
+                // Generate per-component mask image (using original design)
                 if !cli.no_mask {
-                    let stem = comp_path.file_stem().unwrap().to_str().unwrap();
-                    let mask_path = comp_path
+                    let stem = info.path.file_stem().unwrap().to_str().unwrap();
+                    let mask_path = info
+                        .path
                         .parent()
                         .unwrap_or(Path::new("."))
                         .join(format!("{}-matches-{}.png", stem, count));
                     if let Err(e) =
-                        generate_mask_image(&design, &positions, &comp_name, &mask_path)
+                        generate_mask_image(&design, &positions, comp_name, &mask_path)
                     {
                         eprintln!("    warning: failed to generate mask: {}", e);
                     } else {
@@ -583,7 +870,7 @@ fn main() -> Result<()> {
                 }
 
                 all_matches.push(MatchEntry {
-                    component: comp_name,
+                    component: comp_name.clone(),
                     count,
                     positions,
                 });
@@ -592,6 +879,99 @@ fn main() -> Result<()> {
                 eprintln!("    skipped: {}", e);
             }
         }
+    }
+
+    // Second pass: mask all first-pass matches on a working copy, then retry
+    // EVERY component. For each, keep the result with higher confidence.
+    // This fixes cases where overlapping components degrade a large component's
+    // score below that of a false match (correct match surfaces after masking).
+    {
+        let mut working = design.clone();
+
+        // Mask first-pass matches (largest first so embedded components' borders
+        // sample the large component's color).
+        let mut pass1_sorted: Vec<&MatchEntry> = all_matches.iter().collect();
+        pass1_sorted.sort_by(|a, b| {
+            let a_area = a.positions.first().map(|p| p.width * p.height).unwrap_or(0);
+            let b_area = b.positions.first().map(|p| p.width * p.height).unwrap_or(0);
+            b_area.cmp(&a_area)
+        });
+        for entry in &pass1_sorted {
+            let comp_path = comp_infos.iter().find(|i| i.name == entry.component).map(|i| &i.path);
+            if let Some(path) = comp_path {
+                if let Ok((_, mask)) = load_with_mask(path, 0) {
+                    for pos in &entry.positions {
+                        let rect = Rect::new(pos.x, pos.y, pos.width, pos.height);
+                        let _ = mask_region(&mut working, rect, &mask);
+                    }
+                }
+            }
+        }
+
+        for info in &comp_infos {
+            let comp_name = &info.name;
+            let (templ, mask) = load_with_mask(&info.path, cli.alpha_threshold)?;
+
+            if let Ok((matched_at, positions)) = match_component(
+                &working, &templ, &mask, comp_name,
+                cli.start_threshold, cli.threshold_step, cli.nms_threshold,
+            ) {
+                // Compare with first-pass result (if any), keep the better one
+                let pass2_best = positions.iter().map(|p| p.confidence).fold(0.0f64, f64::max);
+
+                if let Some(existing) = all_matches.iter_mut().find(|m| m.component == *comp_name) {
+                    let pass1_best = existing.positions.iter().map(|p| p.confidence).fold(0.0f64, f64::max);
+                    if pass2_best > pass1_best {
+                        eprintln!("  Replacing {}: pass2 conf={:.4} > pass1 conf={:.4}",
+                            comp_name, pass2_best, pass1_best);
+                        let count = positions.len();
+                        if !cli.no_mask {
+                            let stem = info.path.file_stem().unwrap().to_str().unwrap();
+                            let mask_path = info.path.parent().unwrap_or(Path::new("."))
+                                .join(format!("{}-matches-{}.png", stem, count));
+                            let _ = generate_mask_image(&design, &positions, comp_name, &mask_path);
+                        }
+                        *existing = MatchEntry {
+                            component: comp_name.clone(),
+                            count,
+                            positions,
+                        };
+                    }
+                } else {
+                    let count = positions.len();
+                    eprintln!("  Found {} in pass2: {} match(es) @threshold={}",
+                        comp_name, count, matched_at);
+                    if !cli.no_mask {
+                        let stem = info.path.file_stem().unwrap().to_str().unwrap();
+                        let mask_path = info.path.parent().unwrap_or(Path::new("."))
+                            .join(format!("{}-matches-{}.png", stem, count));
+                        let _ = generate_mask_image(&design, &positions, comp_name, &mask_path);
+                    }
+                    all_matches.push(MatchEntry {
+                        component: comp_name.clone(),
+                        count,
+                        positions,
+                    });
+                }
+            }
+        }
+    }
+
+    // Generate reconstructed design
+    let reconstructed_path = cli
+        .output
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("try-implement-design.png");
+    if let Err(e) = generate_reconstructed_design(
+        (design_w, design_h),
+        &all_matches,
+        &cli.components_dir,
+        &reconstructed_path,
+    ) {
+        eprintln!("    warning: failed to generate reconstructed design: {}", e);
+    } else {
+        eprintln!("Reconstructed design -> {}", reconstructed_path.display());
     }
 
     // Output TOML
