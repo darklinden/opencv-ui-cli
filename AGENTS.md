@@ -241,10 +241,14 @@ components/
 
 ### 检测流程
 
-Python 侧边车 `scripts/yolo_detect.py` 负责两件事：
+Python 侧边车 `scripts/yolo_detect.py` 编译时通过 `include_str!` 嵌入二进制，运行时释放到 `.opencv-ui-yolo-ext/`。
 
-1. **训练**（按需）：`python3 scripts/yolo_detect.py train --components components/ --output components/.yolo-cache/ui-detect.pt --epochs 50`
-2. **推理**：`python3 scripts/yolo_detect.py detect --model components/.yolo-cache/ui-detect.pt --source design.png --output /tmp/yolo_result.json`
+1. **环境初始化**（首次）：
+   - 创建 `.opencv-ui-yolo-ext/`，释放 `yolo_detect.py`
+   - `python3 -m venv .venv` 创建虚拟环境
+   - `pip install ultralytics` 安装依赖
+2. **训练**（按需）：`.venv/bin/python yolo_detect.py train --components components/ --output ... --epochs 50`
+3. **推理**：`.venv/bin/python yolo_detect.py detect --model ... --source design.png --output yolo_result.json`
 
 推理输出是对 design 的全图检测，包含所有找到的组件位置和类别。
 
@@ -270,9 +274,12 @@ YOLO 结果不会跃升到 `high` ——只有模板匹配能达到 high。
 ### 架构：Python 子进程桥接
 
 - **主流程**：Rust 模板匹配（两轮）→ 收集 low-trust 组件 → 调用 Python 侧边车（训练 + 推理）→ 合并结果
-- **Python 侧边车**：`scripts/yolo_detect.py`，使用 `ultralytics` 库
+- **Python 侧边车**：`scripts/yolo_detect.py`（编译时 `include_str!` 嵌入二进制）
+- **运行时环境**：自动在可执行文件旁创建 `.opencv-ui-yolo-ext/`，内含：
+  - `yolo_detect.py` — 从嵌入字符串释放
+  - `.venv/` — 自动创建 Python venv，安装 ultralytics
 - **通信方式**：临时文件（JSON 输出）
-- **失败策略**：fail-open。Python 未安装 / ultralytics 缺失 / 训练失败 → 模板匹配结果保持不变，输出 warning
+- **失败策略**：fail-open。Python 未安装 / venv 创建失败 / ultralytics 安装失败 / 训练失败 → 模板匹配结果保持不变，输出 warning
 
 ### CLI 接口新增
 
@@ -281,7 +288,6 @@ YOLO 结果不会跃升到 `high` ——只有模板匹配能达到 high。
 --yolo-threshold <FLOAT>  触发 YOLO 的置信度阈值，低于此值的 low-trust 组件走 YOLO。默认 0.5
 --yolo-conf <FLOAT>       YOLO 推理置信度阈值，默认 0.25
 --yolo-epochs <INT>       fine-tune 训练轮数，默认 50
---yolo-python <PATH>      侧边车脚本路径，默认 scripts/yolo_detect.py
 --yolo-cache <PATH>        模型缓存路径，默认 components/.yolo-cache/ui-detect.pt
 ```
 
@@ -332,18 +338,18 @@ source = "yolo"         # 新增："template" | "yolo"，标记来源
 | 文件                      | 变更                                                           |
 | ------------------------- | -------------------------------------------------------------- |
 | `src/main.rs`             | 新增 YOLO CLI 参数、`Position.source` 字段、合并逻辑、可视化   |
-| `src/yolo.rs`             | **新建** — YoloConfig、`run_yolo_fallback()`                   |
-| `scripts/yolo_detect.py`  | **新建** — train + detect 子命令                               |
+| `src/yolo.rs`             | **新建** — YoloConfig、venv 管理、`run_yolo()`、`merge_yolo_results()`，`include_str!` 嵌入脚本 |
+| `scripts/yolo_detect.py`  | **新建** — train + detect 子命令，编译时嵌入二进制                         |
 | `Cargo.toml`              | 新增 `serde_json = "1"`                                        |
 | `.gitignore`              | 新增 `**/.yolo-cache/`、`datasets/`                            |
 
 ### 环境要求
 
 ```bash
-pip3 install ultralytics
-# 首次运行自动下载 yolov8n.pt 预训练权重（ultralytics 缓存到 ~/.cache/）
-python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
-# 微调后的模型缓存到 components/.yolo-cache/ui-detect.pt
+# 仅需系统安装 python3（3.9+），其余自动管理：
+# - .opencv-ui-yolo-ext/.venv/    自动创建
+# - ultralytics + 依赖             自动 pip install
+# - yolov8n.pt 预训练权重          首次训练时 ultralytics 自动缓存到 ~/.cache/
 ```
 
 ### 验证方式

@@ -1,3 +1,5 @@
+mod yolo;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use opencv::{
@@ -13,7 +15,10 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "opencv-ui-cli", about = "Match UI components against a design image")]
+#[command(
+    name = "opencv-ui-cli",
+    about = "Match UI components against a design image"
+)]
 struct Cli {
     /// Path to the design image (e.g. design.png)
     design: PathBuf,
@@ -44,8 +49,28 @@ struct Cli {
     /// Alpha threshold for mask: pixels with alpha below this value are excluded
     /// from template matching. Use 200+ for semi-transparent components (shadows,
     /// glows) to match only the opaque core. Default 0 = include all non-zero alpha.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "50")]
     alpha_threshold: u8,
+
+    /// Enable YOLO fallback detection for low-trust template matches
+    #[arg(long)]
+    yolo: bool,
+
+    /// Confidence threshold below which low-trust components trigger YOLO fallback
+    #[arg(long, default_value = "0.5")]
+    yolo_threshold: f64,
+
+    /// YOLO inference confidence threshold
+    #[arg(long, default_value = "0.25")]
+    yolo_conf: f64,
+
+    /// YOLO fine-tune training epochs
+    #[arg(long, default_value = "50")]
+    yolo_epochs: u32,
+
+    /// Path to cached YOLO model (.pt)
+    #[arg(long)]
+    yolo_cache: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -53,17 +78,24 @@ struct Cli {
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Clone, Debug)]
-struct Position {
+pub(crate) struct Position {
     x: i32,
     y: i32,
     width: i32,
     height: i32,
     confidence: f64,
     trust: String,
+    #[serde(default = "default_source")]
+    source: String,
+}
+
+#[allow(dead_code)]
+fn default_source() -> String {
+    "template".into()
 }
 
 #[derive(Serialize)]
-struct MatchEntry {
+pub(crate) struct MatchEntry {
     component: String,
     count: usize,
     positions: Vec<Position>,
@@ -223,7 +255,7 @@ fn template_variance(templ: &Mat, mask: &Option<Mat>) -> f64 {
 
 /// Run matchTemplate and return all detections above the threshold after NMS.
 /// Returns (confidence, rect) where confidence is normalized to 0..1 (higher = better).
-fn match_template_nms(
+pub(crate) fn match_template_nms(
     design: &Mat,
     templ: &Mat,
     mask: &Option<Mat>,
@@ -252,13 +284,7 @@ fn match_template_nms(
     let mut result = Mat::default();
 
     let mask_mat = mask.as_ref().map_or_else(Mat::default, |m| m.clone());
-    imgproc::match_template(
-        design,
-        templ,
-        &mut result,
-        method,
-        &mask_mat,
-    )?;
+    imgproc::match_template(design, templ, &mut result, method, &mask_mat)?;
 
     // Collect all points passing threshold
     let mut candidates: Vec<(f64, Point)> = Vec::new();
@@ -302,7 +328,7 @@ fn match_template_nms(
     Ok(kept)
 }
 
-fn iou(a: &Rect, b: &Rect) -> f64 {
+pub(crate) fn iou(a: &Rect, b: &Rect) -> f64 {
     let x1 = a.x.max(b.x);
     let y1 = a.y.max(b.y);
     let x2 = (a.x + a.width).min(b.x + b.width);
@@ -327,7 +353,7 @@ fn iou(a: &Rect, b: &Rect) -> f64 {
 // Dynamic threshold descent matching
 // ---------------------------------------------------------------------------
 
-fn trust_label(confidence: f64) -> &'static str {
+pub(crate) fn trust_label(confidence: f64) -> &'static str {
     if confidence >= 0.90 {
         "high"
     } else if confidence >= 0.75 {
@@ -365,6 +391,7 @@ fn match_component(
                     height: th,
                     confidence: (conf * 10000.0).round() / 10000.0,
                     trust: trust_label(conf).into(),
+                    source: "template".into(),
                 })
                 .collect();
             return Ok((threshold, positions));
@@ -407,21 +434,9 @@ fn generate_mask_image(
 
     for pos in positions {
         let (fill, stroke, text_fill) = match pos.trust.as_str() {
-            "high" => (
-                "rgba(0,200,0,0.25)",
-                "rgb(0,180,0)",
-                "rgb(0,140,0)",
-            ),
-            "medium" => (
-                "rgba(200,200,0,0.25)",
-                "rgb(180,180,0)",
-                "rgb(140,140,0)",
-            ),
-            _ => (
-                "rgba(200,0,0,0.25)",
-                "rgb(180,0,0)",
-                "rgb(140,0,0)",
-            ),
+            "high" => ("rgba(0,200,0,0.25)", "rgb(0,180,0)", "rgb(0,140,0)"),
+            "medium" => ("rgba(200,200,0,0.25)", "rgb(180,180,0)", "rgb(140,140,0)"),
+            _ => ("rgba(200,0,0,0.25)", "rgb(180,0,0)", "rgb(140,0,0)"),
         };
 
         svg.push_str(&format!(
@@ -434,12 +449,16 @@ fn generate_mask_image(
             stroke = stroke
         ));
 
+        let source_tag = if pos.source == "yolo" { "[Y] " } else { "" };
         let label = format!(
-            "{} conf:{:.2}",
-            component_name,
-            pos.confidence
+            "{}{} conf:{:.2}",
+            source_tag, component_name, pos.confidence
         );
-        let label_y = if pos.y >= 16 { pos.y - 4 } else { pos.y + pos.height + 14 };
+        let label_y = if pos.y >= 16 {
+            pos.y - 4
+        } else {
+            pos.y + pos.height + 14
+        };
         svg.push_str(&format!(
             r#"<text x="{x}" y="{y}" font-size="13" font-family="sans-serif" fill="{c}">{label}</text>"#,
             x = pos.x,
@@ -642,8 +661,9 @@ fn generate_reconstructed_design(
                             let dst_px = canvas.at_2d_mut::<VecN<u8, 3>>(y + r, x + c)?;
                             let alpha_f = a as f64 / 255.0;
                             for ch in 0..3 {
-                                dst_px[ch] =
-                                    (src_px[ch] as f64 * alpha_f + dst_px[ch] as f64 * (1.0 - alpha_f)) as u8;
+                                dst_px[ch] = (src_px[ch] as f64 * alpha_f
+                                    + dst_px[ch] as f64 * (1.0 - alpha_f))
+                                    as u8;
                             }
                         }
                     }
@@ -660,14 +680,14 @@ fn generate_reconstructed_design(
     // Draw overlay boxes and labels for each component match
     // BGR color palette (distinct per component type)
     let palette: [(f64, f64, f64); 8] = [
-        (203.0, 67.0, 53.0),    // BGR: dark red
-        (46.0, 204.0, 113.0),   // BGR: green
-        (219.0, 152.0, 52.0),   // BGR: blue
-        (18.0, 156.0, 243.0),   // BGR: orange
-        (160.0, 68.0, 155.0),   // BGR: purple
-        (156.0, 188.0, 26.0),   // BGR: teal
-        (34.0, 126.0, 230.0),   // BGR: dark orange
-        (165.0, 111.0, 41.0),   // BGR: dark blue
+        (203.0, 67.0, 53.0),  // BGR: dark red
+        (46.0, 204.0, 113.0), // BGR: green
+        (219.0, 152.0, 52.0), // BGR: blue
+        (18.0, 156.0, 243.0), // BGR: orange
+        (160.0, 68.0, 155.0), // BGR: purple
+        (156.0, 188.0, 26.0), // BGR: teal
+        (34.0, 126.0, 230.0), // BGR: dark orange
+        (165.0, 111.0, 41.0), // BGR: dark blue
     ];
 
     // Build SVG for semi-transparent fill boxes only (text is drawn via OpenCV)
@@ -734,12 +754,18 @@ fn generate_reconstructed_design(
 
         for pos in &entry.positions {
             let rect = Rect::new(pos.x, pos.y, pos.width, pos.height);
-            imgproc::rectangle(&mut canvas, rect, color, 2, imgproc::LINE_8, 0)?;
+            let thickness = if pos.source == "yolo" { 1 } else { 2 };
+            imgproc::rectangle(&mut canvas, rect, color, thickness, imgproc::LINE_8, 0)?;
 
-            let label = format!("{} ({:.2})", short_name, pos.confidence);
+            let source_tag = if pos.source == "yolo" { "[Y] " } else { "" };
+            let label = format!("{}{} ({:.2})", source_tag, short_name, pos.confidence);
             let label_org = Point::new(
                 pos.x,
-                if pos.y >= 20 { pos.y - 6 } else { pos.y + pos.height + 16 },
+                if pos.y >= 20 {
+                    pos.y - 6
+                } else {
+                    pos.y + pos.height + 16
+                },
             );
             imgproc::put_text(
                 &mut canvas,
@@ -803,10 +829,7 @@ fn main() -> Result<()> {
     // Large components are easier to find and mask out, exposing embedded ones.
     let component_paths = component_files(&cli.components_dir)?;
     if component_paths.is_empty() {
-        anyhow::bail!(
-            "no image files found in {}",
-            cli.components_dir.display()
-        );
+        anyhow::bail!("no image files found in {}", cli.components_dir.display());
     }
 
     struct ComponentInfo {
@@ -860,8 +883,7 @@ fn main() -> Result<()> {
                         .parent()
                         .unwrap_or(Path::new("."))
                         .join(format!("{}-matches-{}.png", stem, count));
-                    if let Err(e) =
-                        generate_mask_image(&design, &positions, comp_name, &mask_path)
+                    if let Err(e) = generate_mask_image(&design, &positions, comp_name, &mask_path)
                     {
                         eprintln!("    warning: failed to generate mask: {}", e);
                     } else {
@@ -897,7 +919,10 @@ fn main() -> Result<()> {
             b_area.cmp(&a_area)
         });
         for entry in &pass1_sorted {
-            let comp_path = comp_infos.iter().find(|i| i.name == entry.component).map(|i| &i.path);
+            let comp_path = comp_infos
+                .iter()
+                .find(|i| i.name == entry.component)
+                .map(|i| &i.path);
             if let Some(path) = comp_path {
                 if let Ok((_, mask)) = load_with_mask(path, 0) {
                     for pos in &entry.positions {
@@ -913,21 +938,38 @@ fn main() -> Result<()> {
             let (templ, mask) = load_with_mask(&info.path, cli.alpha_threshold)?;
 
             if let Ok((matched_at, positions)) = match_component(
-                &working, &templ, &mask, comp_name,
-                cli.start_threshold, cli.threshold_step, cli.nms_threshold,
+                &working,
+                &templ,
+                &mask,
+                comp_name,
+                cli.start_threshold,
+                cli.threshold_step,
+                cli.nms_threshold,
             ) {
                 // Compare with first-pass result (if any), keep the better one
-                let pass2_best = positions.iter().map(|p| p.confidence).fold(0.0f64, f64::max);
+                let pass2_best = positions
+                    .iter()
+                    .map(|p| p.confidence)
+                    .fold(0.0f64, f64::max);
 
                 if let Some(existing) = all_matches.iter_mut().find(|m| m.component == *comp_name) {
-                    let pass1_best = existing.positions.iter().map(|p| p.confidence).fold(0.0f64, f64::max);
+                    let pass1_best = existing
+                        .positions
+                        .iter()
+                        .map(|p| p.confidence)
+                        .fold(0.0f64, f64::max);
                     if pass2_best > pass1_best {
-                        eprintln!("  Replacing {}: pass2 conf={:.4} > pass1 conf={:.4}",
-                            comp_name, pass2_best, pass1_best);
+                        eprintln!(
+                            "  Replacing {}: pass2 conf={:.4} > pass1 conf={:.4}",
+                            comp_name, pass2_best, pass1_best
+                        );
                         let count = positions.len();
                         if !cli.no_mask {
                             let stem = info.path.file_stem().unwrap().to_str().unwrap();
-                            let mask_path = info.path.parent().unwrap_or(Path::new("."))
+                            let mask_path = info
+                                .path
+                                .parent()
+                                .unwrap_or(Path::new("."))
                                 .join(format!("{}-matches-{}.png", stem, count));
                             let _ = generate_mask_image(&design, &positions, comp_name, &mask_path);
                         }
@@ -939,11 +981,16 @@ fn main() -> Result<()> {
                     }
                 } else {
                     let count = positions.len();
-                    eprintln!("  Found {} in pass2: {} match(es) @threshold={}",
-                        comp_name, count, matched_at);
+                    eprintln!(
+                        "  Found {} in pass2: {} match(es) @threshold={}",
+                        comp_name, count, matched_at
+                    );
                     if !cli.no_mask {
                         let stem = info.path.file_stem().unwrap().to_str().unwrap();
-                        let mask_path = info.path.parent().unwrap_or(Path::new("."))
+                        let mask_path = info
+                            .path
+                            .parent()
+                            .unwrap_or(Path::new("."))
                             .join(format!("{}-matches-{}.png", stem, count));
                         let _ = generate_mask_image(&design, &positions, comp_name, &mask_path);
                     }
@@ -953,6 +1000,179 @@ fn main() -> Result<()> {
                         positions,
                     });
                 }
+            }
+        }
+    }
+
+    // YOLO fallback for low-trust components
+    if cli.yolo {
+        let cache_path = cli
+            .yolo_cache
+            .clone()
+            .unwrap_or_else(|| cli.components_dir.join(".yolo-cache").join("ui-detect.pt"));
+
+        let yolo_config = yolo::YoloConfig {
+            enabled: true,
+            threshold: cli.yolo_threshold,
+            conf: cli.yolo_conf,
+            epochs: cli.yolo_epochs,
+            cache: cache_path,
+        };
+
+        eprintln!("--- YOLO fallback ---");
+        match yolo::run_yolo(&yolo_config, &cli.design, &cli.components_dir) {
+            Ok(Some(detections)) => {
+                // Use YOLO regions as search proposals for precise template matching
+                for entry in &mut all_matches {
+                    let comp_stem = Path::new(&entry.component)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+
+                    let yolo_dets: Vec<_> = detections
+                        .iter()
+                        .filter(|d| d.class_name == comp_stem)
+                        .collect();
+
+                    if yolo_dets.is_empty() {
+                        continue;
+                    }
+
+                    let (templ, mask) =
+                        load_with_mask(&cli.components_dir.join(&entry.component), cli.alpha_threshold)
+                            .unwrap_or_else(|_| (Mat::default(), None));
+                    if templ.empty() {
+                        continue;
+                    }
+
+                    let mut new_positions: Vec<Position> = Vec::new();
+                    let mut yolo_used = vec![false; yolo_dets.len()];
+
+                    for pos in &entry.positions {
+                        if pos.trust == "low" && pos.confidence < cli.yolo_threshold {
+                            // Find best overlapping YOLO detection
+                            let pos_rect = Rect::new(pos.x, pos.y, pos.width, pos.height);
+                            let mut best_iou = 0.0f64;
+                            let mut best_idx: Option<usize> = None;
+
+                            for (i, yd) in yolo_dets.iter().enumerate() {
+                                if yolo_used[i] {
+                                    continue;
+                                }
+                                let yd_rect =
+                                    Rect::new(yd.bbox[0], yd.bbox[1], yd.bbox[2], yd.bbox[3]);
+                                let iou_val = iou(&pos_rect, &yd_rect);
+                                if iou_val > best_iou {
+                                    best_iou = iou_val;
+                                    best_idx = Some(i);
+                                }
+                            }
+
+                            if best_iou >= 0.3 {
+                                let idx = best_idx.unwrap();
+                                yolo_used[idx] = true;
+                                let yd = yolo_dets[idx];
+
+                                // YOLO-guided localized template matching
+                                if let Some(refined) = yolo::refine_yolo_region(
+                                    &design,
+                                    &templ,
+                                    &mask,
+                                    &yd.bbox,
+                                    0.5, // expand YOLO bbox by 50%
+                                    cli.start_threshold,
+                                    cli.threshold_step,
+                                    cli.nms_threshold,
+                                ) {
+                                    eprintln!(
+                                        "    YOLO refine: {} (template {:.4} → refined {:.4} via yolo region)",
+                                        entry.component, pos.confidence, refined.confidence
+                                    );
+                                    new_positions.push(refined);
+                                } else {
+                                    // Template matching failed in YOLO region — keep YOLO
+                                    // bbox as fallback (tagged as yolo source)
+                                    eprintln!(
+                                        "    YOLO fallback: {} keeping yolo bbox (no template match in region)",
+                                        entry.component
+                                    );
+                                    new_positions.push(Position {
+                                        x: yd.bbox[0],
+                                        y: yd.bbox[1],
+                                        width: yd.bbox[2],
+                                        height: yd.bbox[3],
+                                        confidence: (yd.confidence * 10000.0).round() / 10000.0,
+                                        trust: if yd.confidence >= 0.75 {
+                                            "medium".into()
+                                        } else {
+                                            "low".into()
+                                        },
+                                        source: "yolo".into(),
+                                    });
+                                }
+                            } else {
+                                new_positions.push(pos.clone());
+                            }
+                        } else {
+                            new_positions.push(pos.clone());
+                        }
+                    }
+
+                    // Append remaining unused YOLO detections as new positions
+                    for (i, yd) in yolo_dets.iter().enumerate() {
+                        if !yolo_used[i] {
+                            // Try localized template matching first
+                            if let Some(refined) = yolo::refine_yolo_region(
+                                &design,
+                                &templ,
+                                &mask,
+                                &yd.bbox,
+                                0.5,
+                                cli.start_threshold,
+                                cli.threshold_step,
+                                cli.nms_threshold,
+                            ) {
+                                eprintln!(
+                                    "    YOLO append (refined): {} at ({},{})",
+                                    entry.component, refined.x, refined.y
+                                );
+                                new_positions.push(refined);
+                            } else {
+                                eprintln!(
+                                    "    YOLO append: {} new position ({},{} {}x{} conf={:.4})",
+                                    entry.component,
+                                    yd.bbox[0],
+                                    yd.bbox[1],
+                                    yd.bbox[2],
+                                    yd.bbox[3],
+                                    yd.confidence
+                                );
+                                new_positions.push(Position {
+                                    x: yd.bbox[0],
+                                    y: yd.bbox[1],
+                                    width: yd.bbox[2],
+                                    height: yd.bbox[3],
+                                    confidence: (yd.confidence * 10000.0).round() / 10000.0,
+                                    trust: if yd.confidence >= 0.75 {
+                                        "medium".into()
+                                    } else {
+                                        "low".into()
+                                    },
+                                    source: "yolo".into(),
+                                });
+                            }
+                        }
+                    }
+
+                    entry.positions = new_positions;
+                    entry.count = entry.positions.len();
+                }
+            }
+            Ok(None) => {
+                eprintln!("    YOLO unavailable, keeping template results");
+            }
+            Err(e) => {
+                eprintln!("    warning: YOLO failed: {}", e);
             }
         }
     }
@@ -969,7 +1189,10 @@ fn main() -> Result<()> {
         &cli.components_dir,
         &reconstructed_path,
     ) {
-        eprintln!("    warning: failed to generate reconstructed design: {}", e);
+        eprintln!(
+            "    warning: failed to generate reconstructed design: {}",
+            e
+        );
     } else {
         eprintln!("Reconstructed design -> {}", reconstructed_path.display());
     }
